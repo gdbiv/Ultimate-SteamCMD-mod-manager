@@ -20,7 +20,7 @@ Qt GUI program for downloading, updating and managing Steam Workshop mods via St
 4. `py steamcmd_mod_manager.py`
 
 ### Linux
-
+'''
 python3 -m venv .venv
 source .venv/bin/activate
 'or for fish users - source .venv/bin/activate.fish'
@@ -33,7 +33,7 @@ chmod +x steamcmd.sh
 ./steamcmd.sh +quit
 
 python3 steamcmd_mod_manager.py
-
+'''
 On first launch it tries to find SteamCMD; if that fails, point it at `steamcmd.exe` / `steamcmd.sh` yourself.
 
 ## Notes
