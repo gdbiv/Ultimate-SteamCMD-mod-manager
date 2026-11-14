@@ -1,4 +1,5 @@
 # Ultimate-SteamCMD-mod-manager
+<img width="1320" height="885" alt="image" src="https://github.com/user-attachments/assets/1547aac6-4947-43dd-b52a-3c1aceee6bfe" />
 
 Qt GUI program for downloading, updating and managing Steam Workshop mods via SteamCMD for the black flag sailers.
 
