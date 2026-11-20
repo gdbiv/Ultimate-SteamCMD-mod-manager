@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 # steamcmd_mod_manager.py
 """
@@ -6,8 +7,11 @@ SteamCMD Workshop Mod Manager — Windows & Linux GUI wrapper (PyQt6 + QtWebEngi
 Deps:  pip install PyQt6 PyQt6-WebEngine
 Run:   python steamcmd_mod_manager.py      (Windows: py steamcmd_mod_manager.py)
 
-The UI follows the system Qt palette by default. Open Settings to switch
-between System / Dark / Light / Steam color schemes (more options later).
+Folder layouts: some games keep the real mod deeper inside a workshop item
+(e.g. Project Zomboid: <id>/mods/Crossed). Each profile has a layout rule that
+decides what actually lands in the mods folder: Auto-detect, Keep as-is,
+Project Zomboid (mods/*), or Custom (inner path + strip levels + fan-out).
+Changing the rule on an existing profile can re-apply it from cached downloads.
 
 If the embedded browser stays blank on Linux (e.g. running as root), uncomment:
 # os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--no-sandbox")
@@ -31,9 +35,9 @@ from PyQt6.QtGui import (QAction, QDesktopServices, QColor, QIcon, QPainter,
 from PyQt6.QtWebEngineWidgets import QWebEngineView  # import before QApplication
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
-    QFormLayout, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
+    QFormLayout, QFrame, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
-    QPlainTextEdit, QPushButton, QSizePolicy, QSplitter, QToolBar,
+    QPlainTextEdit, QPushButton, QSizePolicy, QSpinBox, QSplitter, QToolBar,
     QVBoxLayout, QWidget,
 )
 
@@ -64,6 +68,13 @@ MOD_COLORS = {
     "magenta": ("Magenta", "#ff4fa0"),
 }
 COLOR_ORDER = list(MOD_COLORS)
+
+LAYOUT_MODES = [
+    ("auto",   "Auto-detect (recommended)"),
+    ("keep",   "Keep workshop folder as-is"),
+    ("pz",     "Project Zomboid — mods/*"),
+    ("custom", "Custom…"),
+]
 
 SORT_MODES = [
     ("name_asc",  "Name A–Z",      lambda i, m: (m.get("title") or i).lower(), False),
@@ -170,6 +181,12 @@ QStatusBar { background: %(panel)s; border-top: 1px solid %(border)s; color: %(s
 QFrame#panel { background: %(panel)s; border: 1px solid %(border)s; border-radius: 10px; }
 QLabel#panelTitle { color: %(accent)s; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
 QLabel#dimLabel { color: %(subtle)s; font-size: 11px; }
+QGroupBox { border: 1px solid %(border)s; border-radius: 8px; margin-top: 10px;
+            padding: 8px; font-weight: 600; }
+QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: %(accent)s; }
+QSpinBox { background: %(base)s; border: 1px solid %(border)s; border-radius: 6px;
+           padding: 3px 6px; color: %(text)s; }
+QSpinBox:focus { border-color: %(accent)s; }
 QLineEdit, QComboBox, QPlainTextEdit, QListWidget {
     background: %(base)s; border: 1px solid %(border)s; border-radius: 6px;
     padding: 4px 8px; selection-background-color: %(accent)s;
@@ -314,6 +331,131 @@ def hide_dir(path):
             pass
 
 
+def cache_item_path(steamcmd, app_id, item_id):
+    """Locate an already-downloaded workshop item in SteamCMD's cache."""
+    if not steamcmd:
+        return None
+    bases = [Path(steamcmd).parent]
+    if not IS_WIN:
+        bases += [Path.home() / ".local/share/Steam/steamcmd", Path.home() / "Steam"]
+    for b in bases:
+        p = b / "steamapps" / "workshop" / "content" / str(app_id) / str(item_id)
+        if p.is_dir():
+            return p
+    return None
+
+
+# ------------------------------------------------------- folder layouts -----
+def looks_like_mod_root(d):
+    """Heuristic: does this directory itself look like a usable mod?"""
+    return ((d / "mod.info").is_file()            # Project Zomboid
+            or (d / "About" / "About.xml").is_file()  # RimWorld
+            or (d / "About").is_dir()
+            or (d / "meta.cpp").is_file()         # Arma
+            or (d / "addons").is_dir()
+            or (d / "media").is_dir())
+
+
+WRAPPER_FILES = {"workshop.txt", "preview.png", "changelog.txt", "readme.txt",
+                 "readme.md", ".ds_store", "thumbs.db", "license.txt"}
+
+
+def resolve_layout(src, rule):
+    """Return (root_dir, fanout) for a workshop item under a layout rule."""
+    src = Path(src)
+    rule = rule or {}
+    mode = rule.get("mode", "auto")
+
+    if mode == "keep":
+        return src, False
+
+    if mode == "pz":
+        root = src / "mods"
+        return (root, True) if root.is_dir() else (src, False)
+
+    if mode == "custom":
+        root = src
+        sub = (rule.get("subpath") or "").strip()
+        if sub:
+            cand = src.joinpath(*[p for p in re.split(r"[\\/]+", sub) if p])
+            if cand.is_dir():
+                root = cand
+        for _ in range(int(rule.get("strip", 0) or 0)):
+            try:
+                kids = [p for p in root.iterdir() if p.is_dir()]
+            except OSError:
+                break
+            if len(kids) == 1:
+                root = kids[0]
+            else:
+                break
+        return root, bool(rule.get("fanout", True))
+
+    # auto
+    root = src
+    for _ in range(4):
+        pz = root / "mods"
+        try:
+            if pz.is_dir() and any(looks_like_mod_root(c) for c in pz.iterdir() if c.is_dir()):
+                return pz, True
+            if looks_like_mod_root(root):
+                return root, False
+            kids = [p for p in root.iterdir() if p.is_dir()]
+            files = [p for p in root.iterdir() if p.is_file()]
+        except OSError:
+            break
+        if len(kids) == 1 and all(f.name.lower() in WRAPPER_FILES for f in files):
+            root = kids[0]
+            continue
+        break
+    return src, False
+
+
+def plan_install(src, item_id, rule, taken=()):
+    """List of (source_dir, destination_folder_name) pairs for one workshop item."""
+    src = Path(src)
+    root, fanout = resolve_layout(src, rule)
+    taken = set(taken)
+    out, used = [], set()
+    if fanout:
+        try:
+            kids = sorted([p for p in root.iterdir() if p.is_dir()],
+                          key=lambda p: p.name.lower())
+        except OSError:
+            kids = []
+        for k in kids:
+            name = k.name
+            if name in taken or name in used:
+                name = f"{name}_{item_id}"
+            used.add(name)
+            out.append((k, name))
+        if out:
+            return out
+    name = str(item_id)
+    if name in taken:
+        name = f"{item_id}_mod"
+    return [(root, name)]
+
+
+def cache_name_map(app_id, rule, steamcmd):
+    """folder-name -> workshop id, derived from cached items (helps importing
+    already-flattened folders that carry no id of their own)."""
+    mapping = {}
+    if not steamcmd or not app_id:
+        return mapping
+    base = Path(steamcmd).parent / "steamapps" / "workshop" / "content" / str(app_id)
+    if not base.is_dir():
+        return mapping
+    for item in base.iterdir():
+        if item.is_dir() and item.name.isdigit():
+            try:
+                for _, name in plan_install(item, item.name, rule):
+                    mapping.setdefault(name.lower(), item.name)
+            except OSError:
+                pass
+    return mapping
+
+
 # ------------------------------------------------------------- steam api ----
 def api_post(method, fields):
     req = urllib.request.Request(API_URL.format(method=method),
@@ -373,19 +515,23 @@ def detect_workshop_id(d):
     return None
 
 
-def scan_mods_folder(mods_dir):
+def scan_mods_folder(mods_dir, app_id=None, rule=None, steamcmd=""):
     base = Path(mods_dir)
     found, skipped = {}, 0
     if not base.is_dir():
         return found, skipped
+    cmap = cache_name_map(app_id, rule, steamcmd)
 
     def consider(d, enabled):
         nonlocal skipped
-        iid = detect_workshop_id(d)
-        if iid:
-            found.setdefault(iid, {"name": d.name, "path": str(d), "enabled": enabled})
-        else:
+        iid = detect_workshop_id(d) or cmap.get(d.name.lower())
+        if not iid:
             skipped += 1
+            return
+        e = found.setdefault(iid, {"name": d.name, "paths": [], "enabled": enabled})
+        e["paths"].append(str(d))
+        if enabled:
+            e["enabled"] = True
 
     for d in sorted(base.iterdir()):
         if d.is_dir() and not d.name.startswith("."):
@@ -455,7 +601,7 @@ class WorkshopView(QWebEngineView):
 
 # ---------------------------------------------------------- steamcmd worker --
 class SteamWorker(QThread):
-    """Sequential job queue: steamcmd downloads, then copy into mods folder."""
+    """Sequential job queue: steamcmd downloads, then layout-aware install."""
     log = pyqtSignal(str)
     item_done = pyqtSignal(str, str, bool, object)  # profile, item_id, ok, meta
 
@@ -500,33 +646,58 @@ class SteamWorker(QThread):
         item = job["item_id"]
         self._cancel_current = False
         ok, src = False, None
-        for attempt in range(1, 4):
-            if self._stop or self._cancel_current:
-                break
-            self.log.emit(f"--- downloading {item} (attempt {attempt}/3) ---")
-            ok, src = self._run_once(job)
-            if ok:
-                break
-            if attempt < 3 and not (self._stop or self._cancel_current):
-                self.log.emit(f"[{item}] failed, retrying in 5 s…")
-                time.sleep(5)
+
+        cached = cache_item_path(job["steamcmd"], job["app_id"], item)
+        if job.get("copy_only") and cached:
+            ok, src = True, str(cached)
+            self.log.emit(f"[{item}] re-installing from cached download")
+        else:
+            for attempt in range(1, 4):
+                if self._stop or self._cancel_current:
+                    break
+                self.log.emit(f"--- downloading {item} (attempt {attempt}/3) ---")
+                ok, src = self._run_once(job)
+                if ok:
+                    break
+                if attempt < 3 and not (self._stop or self._cancel_current):
+                    self.log.emit(f"[{item}] failed, retrying in 5 s…")
+                    time.sleep(5)
         if not ok or not src:
             self.log.emit(f"[{item}] FAILED.")
             self.item_done.emit(job["profile"], item, False, job.get("meta"))
             return
-        dst = Path(job["mods_dir"]) / item
+
+        base = Path(job["mods_dir"])
         try:
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            if dst.exists():
-                shutil.rmtree(dst)
-            self.log.emit(f"[{item}] copying to {dst} …")
-            shutil.copytree(src, dst)
+            base.mkdir(parents=True, exist_ok=True)
+            pairs = plan_install(src, item, job.get("layout"), job.get("taken_names", ()))
+            # drop folders produced by the previous install (layout may have changed)
+            for old in job.get("old_folders", []):
+                for d in (base / old, base / ".disabled" / old):
+                    if d.exists():
+                        shutil.rmtree(d, ignore_errors=True)
+            names = []
+            for s, name in pairs:
+                dst = base / name
+                if dst.exists():
+                    shutil.rmtree(dst)
+                rel = os.path.relpath(s, src)
+                self.log.emit(f"[{item}] {rel}  ->  {name}/")
+                shutil.copytree(s, dst)
+                names.append(name)
+            for name in names:
+                d = base / ".disabled" / name
+                if d.exists():
+                    shutil.rmtree(d, ignore_errors=True)
         except Exception as e:
-            self.log.emit(f"[{item}] copy failed: {e}")
+            self.log.emit(f"[{item}] install failed: {e}")
             self.item_done.emit(job["profile"], item, False, job.get("meta"))
             return
-        self.log.emit(f"[{item}] installed.")
-        self.item_done.emit(job["profile"], item, True, job.get("meta"))
+
+        meta = dict(job.get("meta") or {})
+        meta["folders"] = names
+        self.log.emit(f"[{item}] installed ({len(names)} folder(s)).")
+        self.item_done.emit(job["profile"], item, True, meta)
 
     def _run_once(self, job):
         args = [job["steamcmd"]]
@@ -563,14 +734,8 @@ class SteamWorker(QThread):
         m = re.search(rf'Downloaded item {job["item_id"]} to "([^"]+)"', text)
         src = m.group(1) if m else None
         if not src:
-            bases = [Path(job["steamcmd"]).parent]
-            if not IS_WIN:
-                bases += [Path.home() / ".local/share/Steam/steamcmd", Path.home() / "Steam"]
-            for base in bases:
-                c = base / "steamapps/workshop/content" / str(job["app_id"]) / str(job["item_id"])
-                if c.is_dir():
-                    src = str(c)
-                    break
+            c = cache_item_path(job["steamcmd"], job["app_id"], job["item_id"])
+            src = str(c) if c else None
         return (ok and src is not None), src
 
 
@@ -579,12 +744,13 @@ class ProfileDialog(QDialog):
     def __init__(self, parent, data=None, taken=()):
         super().__init__(parent)
         self.setWindowTitle("Game profile")
+        self.setMinimumWidth(560)
         self.taken = set(taken)
         d = data or {}
         f = QFormLayout(self)
         self.name = QLineEdit(d.get("name", ""))
         self.appid = QLineEdit(str(d.get("app_id", "")))
-        self.appid.setPlaceholderText("e.g. 294100 for RimWorld")
+        self.appid.setPlaceholderText("e.g. 294100 RimWorld, 108600 Project Zomboid")
         self.mods_dir = QLineEdit(d.get("mods_dir", ""))
         browse = QPushButton("Browse…")
         browse.clicked.connect(self._browse)
@@ -604,6 +770,45 @@ class ProfileDialog(QDialog):
         f.addRow("Steam login (optional):", self.user)
         f.addRow("Password:", self.pw)
         f.addRow("", self.force)
+
+        # -- folder layout --
+        rule = d.get("layout") or {}
+        gb = QGroupBox("Folder layout")
+        gl = QFormLayout(gb)
+        self.layout_mode = QComboBox()
+        for k, label in LAYOUT_MODES:
+            self.layout_mode.addItem(label, k)
+        mode = rule.get("mode", "auto")
+        self.layout_mode.setCurrentIndex(
+            max(0, next((i for i, (k, _) in enumerate(LAYOUT_MODES) if k == mode), 0)))
+        self.layout_sub = QLineEdit(rule.get("subpath", "mods"))
+        self.layout_strip = QSpinBox()
+        self.layout_strip.setRange(0, 6)
+        self.layout_strip.setValue(int(rule.get("strip", 0) or 0))
+        self.layout_fan = QCheckBox("Each subfolder is a separate mod")
+        self.layout_fan.setChecked(bool(rule.get("fanout", True)))
+        self.custom_row = QWidget()
+        ch = QFormLayout(self.custom_row)
+        ch.setContentsMargins(0, 0, 0, 0)
+        ch.addRow("Inner path:", self.layout_sub)
+        ch.addRow("Strip extra levels:", self.layout_strip)
+        ch.addRow("", self.layout_fan)
+        prev = QPushButton("Preview…")
+        prev.setToolTip("Show what a downloaded workshop item would become")
+        prev.clicked.connect(self._preview_layout)
+        gl.addRow("Mode:", self.layout_mode)
+        gl.addRow(self.custom_row)
+        gl.addRow("", prev)
+        hint = QLabel("Auto handles Project Zomboid (<id>/mods/*), RimWorld, Arma and\n"
+                      "single-wrapper folders. Custom lets you pick an inner path,\n"
+                      "strip extra levels, and fan subfolders out as separate mods.")
+        hint.setObjectName("dimLabel")
+        hint.setWordWrap(True)
+        gl.addRow(hint)
+        f.addRow(gb)
+        self.layout_mode.currentIndexChanged.connect(self._sync_layout)
+        self._sync_layout()
+
         note = QLabel("Empty login = anonymous (works for most games' workshops).\n"
                       "If a game requires an account, the password is stored in plain\n"
                       "text in the config file. For Steam Guard, log in once in a terminal.\n"
@@ -617,6 +822,45 @@ class ProfileDialog(QDialog):
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         f.addRow(bb)
+
+    def _sync_layout(self):
+        self.custom_row.setVisible(self.layout_mode.currentData() == "custom")
+        self.adjustSize()
+
+    def _layout_values(self):
+        mode = self.layout_mode.currentData()
+        r = {"mode": mode}
+        if mode == "custom":
+            r.update(subpath=self.layout_sub.text().strip(),
+                     strip=self.layout_strip.value(),
+                     fanout=self.layout_fan.isChecked())
+        return r
+
+    def _preview_layout(self):
+        parent = self.parent()
+        sc = getattr(parent, "cfg", {}).get("steamcmd", "")
+        appid = self.appid.text().strip()
+        sample = None
+        if sc and appid.isdigit():
+            base = Path(sc).parent / "steamapps" / "workshop" / "content" / appid
+            if base.is_dir():
+                sample = next((x for x in sorted(base.iterdir()) if x.is_dir()), None)
+        if sample is None:
+            d = QFileDialog.getExistingDirectory(
+                self, "Pick a sample workshop item folder",
+                str(Path(sc).parent if sc else Path.home()))
+            if not d:
+                return
+            sample = Path(d)
+        try:
+            pairs = plan_install(sample, sample.name, self._layout_values())
+        except Exception as e:
+            QMessageBox.warning(self, "Layout preview", f"Could not read folder:\n{e}")
+            return
+        lines = [f"Sample: {sample}", ""]
+        for s, name in pairs:
+            lines.append(f"  {os.path.relpath(s, sample)}   ->   <mods>/{name}/")
+        QMessageBox.information(self, "Layout preview", "\n".join(lines))
 
     def _browse(self):
         d = QFileDialog.getExistingDirectory(self, "Choose mods folder",
@@ -642,7 +886,8 @@ class ProfileDialog(QDialog):
                 "mods_dir": self.mods_dir.text().strip(),
                 "username": self.user.text().strip(),
                 "password": self.pw.text(),
-                "force_windows": self.force.isChecked()}
+                "force_windows": self.force.isChecked(),
+                "layout": self._layout_values()}
 
 
 # ----------------------------------------------------------- settings dialog -
@@ -734,6 +979,7 @@ class MainWindow(QMainWindow):
         self.addToolBar(tb2)
         for text, slot in (("+ Add by ID…", self.add_by_id),
                            ("⟳ Update all mods", self.update_all),
+                           ("⇄ Re-apply folder layout", self.reapply_layout_clicked),
                            ("✕ Cancel queue", self.cancel_queue),
                            ("Open mods folder", self.open_mods_folder)):
             a = QAction(text, self)
@@ -979,25 +1225,27 @@ class MainWindow(QMainWindow):
         w.style().polish(w)
 
     @staticmethod
-    def mod_paths(p, iid):
-        base = Path(p["mods_dir"])
-        return base / iid, base / ".disabled" / iid
+    def mod_folders(p, iid):
+        return p["items"].get(iid, {}).get("folders") or [iid]
 
     def place_mod(self, p, iid, enabled):
-        """Keep the mod folder in <mods>/ or <mods>/.disabled/ per its state."""
-        on, off = self.mod_paths(p, iid)
-        want, other = (on, off) if enabled else (off, on)
-        try:
-            if want.exists():
-                if other.exists():
-                    shutil.rmtree(other)
-            elif other.exists():
-                want.parent.mkdir(parents=True, exist_ok=True)
-                if want.parent.name == ".disabled":
-                    hide_dir(want.parent)
-                shutil.move(str(other), str(want))
-        except Exception as e:
-            self.log(f"[{iid}] could not move folder: {e}")
+        """Keep every folder of a mod in <mods>/ or <mods>/.disabled/."""
+        base = Path(p["mods_dir"])
+        off = base / ".disabled"
+        for name in self.mod_folders(p, iid):
+            want = (base if enabled else off) / name
+            other = (off if enabled else base) / name
+            try:
+                if want.exists():
+                    if other.exists():
+                        shutil.rmtree(other)
+                elif other.exists():
+                    want.parent.mkdir(parents=True, exist_ok=True)
+                    if want.parent.name == ".disabled":
+                        hide_dir(want.parent)
+                    shutil.move(str(other), str(want))
+            except Exception as e:
+                self.log(f"[{iid}] could not move '{name}': {e}")
 
     # ---- steamcmd setup ----
     def ensure_steamcmd(self):
@@ -1071,6 +1319,7 @@ class MainWindow(QMainWindow):
         if not p:
             return
         old_dir = p["mods_dir"]
+        old_layout = p.get("layout") or {"mode": "auto"}
         others = [x["name"] for x in self.cfg["profiles"] if x is not p]
         dlg = ProfileDialog(self, data=p, taken=others)
         if dlg.exec() == QDialog.DialogCode.Accepted:
@@ -1083,6 +1332,13 @@ class MainWindow(QMainWindow):
             self.reload_profiles()
             if v["mods_dir"] != old_dir:
                 self.offer_import(v)
+            if v.get("layout") != old_layout and v["items"]:
+                if QMessageBox.question(
+                        self, "Folder layout changed",
+                        f"Re-apply the new folder layout to {len(v['items'])} installed mod(s)?\n"
+                        "Cached downloads are reused when available; old folders are replaced.") \
+                        == QMessageBox.StandardButton.Yes:
+                    self.reapply_layout(v)
 
     def delete_profile(self):
         p = self.profile()
@@ -1097,6 +1353,32 @@ class MainWindow(QMainWindow):
         save_cfg(self.cfg)
         self.reload_profiles()
 
+    # ---- layout re-apply ----
+    def reapply_layout_clicked(self):
+        if not self.ready():
+            return
+        p = self.profile()
+        if not p["items"]:
+            self.log("No mods installed in this profile.")
+            return
+        if QMessageBox.question(
+                self, "Re-apply folder layout",
+                f"Re-install {len(p['items'])} mod(s) using the profile's folder layout?\n"
+                "Cached downloads are reused when available.") \
+                == QMessageBox.StandardButton.Yes:
+            self.reapply_layout(p)
+
+    def reapply_layout(self, p):
+        n = 0
+        for iid, m in list(p["items"].items()):
+            if (p["name"], iid) in self.pending:
+                continue
+            self.enqueue_job(p, iid, {"title": m.get("title", ""),
+                                      "time_updated": m.get("time_updated", 0)},
+                             copy_only=True)
+            n += 1
+        self.log(f"Re-applying folder layout to {n} mod(s)…")
+
     # ---- import existing folder ----
     def import_clicked(self):
         p = self.profile()
@@ -1106,14 +1388,15 @@ class MainWindow(QMainWindow):
         self.offer_import(p, interactive=True)
 
     def offer_import(self, p, interactive=False):
-        found, skipped = scan_mods_folder(p["mods_dir"])
+        found, skipped = scan_mods_folder(p["mods_dir"], p.get("app_id"),
+                                          p.get("layout"), self.cfg.get("steamcmd", ""))
         if not found:
             if interactive:
                 QMessageBox.information(
                     self, "Import",
                     "No workshop mods were detected in this folder.\n"
-                    "IDs are read from numeric folder names, RimWorld About files\n"
-                    "and Arma meta.cpp.")
+                    "IDs are read from numeric folder names, RimWorld About files,\n"
+                    "Arma meta.cpp, or matched against SteamCMD's cached downloads.")
             return
         n_off = sum(1 for v in found.values() if not v["enabled"])
         txt = f"Found {len(found)} workshop mod(s) in:\n{p['mods_dir']}\n"
@@ -1122,7 +1405,7 @@ class MainWindow(QMainWindow):
         if skipped:
             txt += f"{skipped} folder(s) without a workshop ID were skipped.\n"
         txt += ("\nRe-download them all so this tool can manage and update them?\n"
-                "Existing folders will be replaced with fresh copies.")
+                "Existing folders will be replaced and re-shaped to the profile's layout.")
         if QMessageBox.question(self, "Import existing mods", txt,
                                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                 QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
@@ -1134,7 +1417,9 @@ class MainWindow(QMainWindow):
                                "color": prev.get("color", ""),
                                "time_updated": prev.get("time_updated", 0),
                                "installed_at": prev.get("installed_at", 0),
-                               "import_src": info["path"]}
+                               "folders": prev.get("folders") or
+                                          [Path(x).name for x in info["paths"]],
+                               "import_src": info["paths"]}
         save_cfg(self.cfg)
         if p is self.profile():
             self.refresh_mods()
@@ -1214,10 +1499,12 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("color:%s;font-weight:600;background:transparent;"
                             % (self.tc["text"] if enabled else self.tc["subtle"]))
         title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        title.setToolTip(f"{full}\nWorkshop ID: {iid}")
+        folders = meta.get("folders") or [iid]
+        title.setToolTip(f"{full}\nWorkshop ID: {iid}\nFolders: {', '.join(folders)}")
         ts = meta.get("installed_at", 0)
         date = time.strftime("%Y-%m-%d", time.localtime(ts)) if ts else "pending"
-        sub = QLabel(f"{iid}  ·  {date}")
+        extra = f"  ·  {len(folders)} folders" if len(folders) > 1 else ""
+        sub = QLabel(f"{iid}  ·  {date}{extra}")
         sub.setStyleSheet(f"color:{self.tc['subtle']};font-size:11px;background:transparent;")
         v = QVBoxLayout()
         v.setSpacing(1)
@@ -1226,8 +1513,6 @@ class MainWindow(QMainWindow):
         v.addWidget(sub)
         h.addLayout(v, 1)
 
-        # Right-click anywhere on the row opens the mod context menu;
-        # a left press selects the row.
         for w in [row] + row.findChildren(QWidget):
             w.setProperty("mod_id", iid)
             w.installEventFilter(self)
@@ -1264,6 +1549,7 @@ class MainWindow(QMainWindow):
 
         act("Re-download", lambda: self.redownload(iid))
         act("Update", lambda: self.update_mods([iid]))
+        act("Re-apply folder layout", lambda: self.reapply_one(iid))
         cm = menu.addMenu("Set color")
         for key, (label, hexs) in MOD_COLORS.items():
             a = cm.addAction(color_icon(hexs), label)
@@ -1277,6 +1563,16 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         act("Remove", lambda: self.remove_mod(iid))
         menu.exec(global_pos)
+
+    def reapply_one(self, iid):
+        if not self.ready():
+            return
+        p = self.profile()
+        m = p["items"].get(iid)
+        if not m or (p["name"], iid) in self.pending:
+            return
+        self.enqueue_job(p, iid, {"title": m.get("title", ""),
+                                  "time_updated": m.get("time_updated", 0)}, copy_only=True)
 
     def toggle_mod(self, iid):
         p = self.profile()
@@ -1324,12 +1620,13 @@ class MainWindow(QMainWindow):
         title = p["items"][iid].get("title") or iid
         if QMessageBox.question(self, "Delete mod",
                                 f"Delete '{title}' [{iid}]?\n"
-                                "Its folder will be removed from the mods directory.") \
+                                "All of its folders will be removed from the mods directory.") \
                 != QMessageBox.StandardButton.Yes:
             return
-        on, off = self.mod_paths(p, iid)
-        for d in (on, off):
-            shutil.rmtree(d, ignore_errors=True)
+        base = Path(p["mods_dir"])
+        for name in self.mod_folders(p, iid):
+            for d in (base / name, base / ".disabled" / name):
+                shutil.rmtree(d, ignore_errors=True)
         p["items"].pop(iid, None)
         save_cfg(self.cfg)
         self.refresh_mods()
@@ -1349,8 +1646,15 @@ class MainWindow(QMainWindow):
         p = self.profile()
         if not p:
             return
-        on, off = self.mod_paths(p, iid)
-        target = on if on.exists() else off if off.exists() else Path(p["mods_dir"])
+        base = Path(p["mods_dir"])
+        target = base
+        for name in self.mod_folders(p, iid):
+            for d in (base / name, base / ".disabled" / name):
+                if d.exists():
+                    target = d
+                    break
+            if target != base:
+                break
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
 
     def open_mods_folder(self):
@@ -1495,7 +1799,13 @@ class MainWindow(QMainWindow):
         else:
             self.log(f"[{cid}] not found on workshop (deleted, private or invalid id).")
 
-    def enqueue_job(self, p, iid, meta):
+    def enqueue_job(self, p, iid, meta, copy_only=False):
+        prev = p["items"].get(iid, {})
+        old_folders = prev.get("folders") or [iid]
+        taken = set()
+        for other, m in p["items"].items():
+            if other != iid:
+                taken.update(m.get("folders") or [other])
         self.pending.add((p["name"], iid))
         self.update_queue_label()
         self.worker.enqueue({"profile": p["name"], "app_id": p["app_id"], "item_id": iid,
@@ -1503,6 +1813,10 @@ class MainWindow(QMainWindow):
                              "username": p.get("username", ""),
                              "password": p.get("password", ""),
                              "force_windows": p.get("force_windows", False),
+                             "layout": p.get("layout") or {"mode": "auto"},
+                             "old_folders": old_folders,
+                             "taken_names": sorted(taken),
+                             "copy_only": copy_only,
                              "meta": meta})
         self.log(f"Queued: {meta.get('title') or iid} [{iid}]")
 
@@ -1518,20 +1832,26 @@ class MainWindow(QMainWindow):
                  "time_updated": meta.get("time_updated", 0),
                  "installed_at": int(time.time()),
                  "enabled": prev.get("enabled", True),
-                 "color": prev.get("color", "")}
+                 "color": prev.get("color", ""),
+                 "folders": meta.get("folders") or [iid]}
         p["items"][iid] = entry
         save_cfg(self.cfg)
         self.place_mod(p, iid, entry["enabled"])
-        old = prev.get("import_src")
+        old = prev.get("import_src") or []
+        if isinstance(old, str):
+            old = [old]
         if old:
-            sp = Path(old)
-            on, off = self.mod_paths(p, iid)
-            norm = lambda x: os.path.normpath(str(x))
-            if sp.exists() and norm(sp) not in (norm(on), norm(off)):
-                shutil.rmtree(sp, ignore_errors=True)
-                self.log(f"[{iid}] removed old imported folder '{sp.name}'")
+            base = Path(p["mods_dir"])
+            norm = lambda x: os.path.normcase(os.path.normpath(str(x)))
+            keep = {norm(base / n) for n in entry["folders"]}
+            keep |= {norm(base / ".disabled" / n) for n in entry["folders"]}
+            for o in old:
+                sp = Path(o)
+                if sp.exists() and norm(sp) not in keep:
+                    shutil.rmtree(sp, ignore_errors=True)
+                    self.log(f"[{iid}] removed old imported folder '{sp.name}'")
         if not entry["enabled"]:
-            self.log(f"[{iid}] kept disabled (.disabled/{iid})")
+            self.log(f"[{iid}] kept disabled (.disabled/)")
         if p is self.profile():
             self.refresh_mods()
 
